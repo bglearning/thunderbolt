@@ -14,6 +14,16 @@ import { Elysia, t } from 'elysia'
 import { HaystackAcpServer, type HaystackAcpDeps } from './acp-server'
 import { createHaystackProvider, parsePipelinesEnv } from './provider'
 
+/** The slice of Elysia's socket the handlers below use. */
+type HaystackSocket = {
+  data: unknown
+  send: (payload: string) => unknown
+  close: (code: number, reason: string) => unknown
+}
+
+/** Per-socket slot holding the setup promise `open()` starts; null when the socket was rejected. */
+const serverSlot = (ws: HaystackSocket) => ws.data as { __haystackServer?: Promise<HaystackAcpServer | null> }
+
 /**
  * Mount the Haystack ACP adapter routes.
  *
@@ -39,6 +49,53 @@ export const createHaystackRoutes = (settings: Settings, auth: Auth, deps?: Hays
   registerAgentProvider(createHaystackProvider())
 
   const fetchFn = deps?.fetchFn ?? globalThis.fetch
+
+  /** Authorize the socket and build its ACP server, or close it and return null. */
+  const openHaystackServer = async (ws: HaystackSocket): Promise<HaystackAcpServer | null> => {
+    const log = createStandaloneLogger(settings)
+    const data = ws.data as { request?: Request }
+
+    // Validate the bearer exactly once per accepted socket. Doing this in
+    // `beforeHandle` instead is unsafe because Bun's adapter can call it
+    // more than once per upgrade. The bearer rides a subprotocol entry
+    // (browsers can't set `Authorization` on `new WebSocket()`); it is
+    // verified via the same Better Auth path REST uses (HMAC + DB lookup).
+    const subprotocolHeader = data.request?.headers.get('sec-websocket-protocol') ?? null
+    const user: User | null = await authorizeWsBearer(auth, subprotocolHeader)
+    if (!user) {
+      ws.close(wsCloseUnauthorized, 'unauthorized')
+      return null
+    }
+
+    const url = new URL(data.request?.url ?? 'http://localhost/haystack/ws')
+    const pipelineSlug = url.searchParams.get('pipeline')
+    if (!pipelineSlug) {
+      ws.close(wsCloseUnauthorized, 'missing pipeline parameter')
+      return null
+    }
+
+    // Resolve the public slug back to its Deepset identifiers. A missing
+    // descriptor here means a stale FE URL or a redeploy that dropped the
+    // pipeline — we close instead of opening to keep error surface tight.
+    const descriptor = parsePipelinesEnv(settings).find((p) => p.id === pipelineSlug)
+    if (!descriptor) {
+      ws.close(wsCloseUnauthorized, 'unknown pipeline')
+      return null
+    }
+
+    const server = new HaystackAcpServer({
+      send: (payload) => {
+        ws.send(payload)
+      },
+      pipelineId: descriptor.pipelineId,
+      pipelineName: descriptor.pipelineName,
+      supportsFiles: descriptor.supportedContent.files,
+      settings,
+      deps,
+    })
+    log.debug({ pipelineSlug, pipelineName: descriptor.pipelineName, userId: user.id }, 'haystack ws opened')
+    return server
+  }
 
   return new Elysia({ name: 'haystack-routes', prefix: '/haystack' })
     .onError(safeErrorHandler)
@@ -119,64 +176,26 @@ export const createHaystackRoutes = (settings: Settings, auth: Auth, deps?: Hays
           set.headers['sec-websocket-protocol'] = wsCarrierSubprotocol
         }
       },
-      async open(ws) {
-        const log = createStandaloneLogger(settings)
-        const data = ws.data as unknown as { request?: Request }
-
-        // Validate the bearer exactly once per accepted socket. Doing this in
-        // `beforeHandle` instead is unsafe because Bun's adapter can call it
-        // more than once per upgrade. The bearer rides a subprotocol entry
-        // (browsers can't set `Authorization` on `new WebSocket()`); it is
-        // verified via the same Better Auth path REST uses (HMAC + DB lookup).
-        const subprotocolHeader = data.request?.headers.get('sec-websocket-protocol') ?? null
-        const user: User | null = await authorizeWsBearer(auth, subprotocolHeader)
-        if (!user) {
-          ws.close(wsCloseUnauthorized, 'unauthorized')
-          return
-        }
-
-        const url = new URL(data.request?.url ?? 'http://localhost/haystack/ws')
-        const pipelineSlug = url.searchParams.get('pipeline')
-        if (!pipelineSlug) {
-          ws.close(wsCloseUnauthorized, 'missing pipeline parameter')
-          return
-        }
-
-        // Resolve the public slug back to its Deepset identifiers. A missing
-        // descriptor here means a stale FE URL or a redeploy that dropped the
-        // pipeline — we close instead of opening to keep error surface tight.
-        const descriptor = parsePipelinesEnv(settings).find((p) => p.id === pipelineSlug)
-        if (!descriptor) {
-          ws.close(wsCloseUnauthorized, 'unknown pipeline')
-          return
-        }
-
-        const server = new HaystackAcpServer({
-          send: (payload) => {
-            ws.send(payload)
-          },
-          pipelineId: descriptor.pipelineId,
-          pipelineName: descriptor.pipelineName,
-          supportsFiles: descriptor.supportedContent.files,
-          settings,
-          deps,
-        })
-        ;(ws.data as unknown as { __haystackServer?: HaystackAcpServer }).__haystackServer = server
-        log.debug({ pipelineSlug, pipelineName: descriptor.pipelineName, userId: user.id }, 'haystack ws opened')
+      open(ws) {
+        // Publish the setup promise synchronously, before the first await: the
+        // client sends `initialize` as soon as its socket opens, and Bun can
+        // deliver that frame while the bearer lookup is still in flight.
+        // `message()` awaits this promise instead of dropping the frame.
+        serverSlot(ws).__haystackServer = openHaystackServer(ws)
       },
       async message(ws, message) {
-        const server = (ws.data as unknown as { __haystackServer?: HaystackAcpServer }).__haystackServer
+        // Resolves to null when `open()` rejected the socket.
+        const server = await serverSlot(ws).__haystackServer
         if (!server) {
-          // Auth already rejected this socket; the client may still race a
-          // first frame before the close lands. Drop quietly.
           return
         }
         const text = typeof message === 'string' ? message : JSON.stringify(message)
         await server.handleMessage(text)
       },
-      close(ws) {
-        const slot = ws.data as unknown as { __haystackServer?: HaystackAcpServer }
-        slot.__haystackServer?.dispose()
+      async close(ws) {
+        const slot = serverSlot(ws)
+        const server = await slot.__haystackServer
+        server?.dispose()
         slot.__haystackServer = undefined
       },
     })

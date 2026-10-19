@@ -24,10 +24,13 @@ import { user as userTable, session as sessionTable } from '@/db/auth-schema'
 import { createApp } from '@/index'
 import { createTestApp } from '@/test-utils/e2e'
 import { getSharedIsolatedTestDb, type IsolatedTestDb } from '@/test-utils/db'
-import { clearSettingsCache } from '@/config/settings'
+import type { Auth } from '@/auth/elysia-plugin'
+import { clearSettingsCache, getSettings } from '@/config/settings'
 import { encodeWsBearer } from '@shared/ws-bearer'
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 import { createHmac } from 'crypto'
+import { Elysia } from 'elysia'
+import { createHaystackRoutes } from './routes'
 
 const betterAuthSecret = 'better-auth-secret-12345678901234567890'
 
@@ -266,6 +269,36 @@ describe('WS /v1/haystack/ws — auth gating', () => {
     expect(reply.result.agentCapabilities.loadSession).toBe(true)
     client.close()
   }, 15000)
+
+  it('answers an initialize sent while the bearer lookup is still in flight', async () => {
+    // The client sends `initialize` the moment its socket opens. A slow session
+    // lookup used to leave that frame with no server to handle it, so it was
+    // dropped and the client timed out waiting for the handshake.
+    const slowAuth = {
+      api: {
+        getSession: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 300))
+          return { user: { id: 'user-1', isAnonymous: false } }
+        },
+      },
+    } as unknown as Auth
+    const app = new Elysia().use(createHaystackRoutes(getSettings(), slowAuth))
+    const port = await startApp(app as unknown as RunningApp)
+    cleanups.push(() => stopApp(app as unknown as RunningApp))
+
+    const client = new WebSocket(`ws://127.0.0.1:${port}/haystack/ws?pipeline=rag`, bearerProtocols('token.sig'))
+    await new Promise<void>((resolve, reject) => {
+      client.addEventListener('open', () => resolve())
+      client.addEventListener('close', () => reject(new Error('closed before open')))
+    })
+
+    const replyPromise = nextMessage(client)
+    client.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize' }))
+    const reply = JSON.parse(await replyPromise)
+    expect(reply.id).toBe(1)
+    expect(reply.result.protocolVersion).toBeGreaterThan(0)
+    client.close()
+  })
 
   it('closes 4001 when the ?pipeline= slug is not in HAYSTACK_PIPELINES', async () => {
     const handle = await createTestApp({ database: iso.db })
