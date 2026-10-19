@@ -71,3 +71,36 @@ export const authorizeWsBearer = async (auth: Auth, subprotocolHeader: string | 
   }
   return user
 }
+
+/**
+ * Cookie fallback for a same-origin WebSocket upgrade that carried no bearer.
+ *
+ * The web SSO flow ends in a browser redirect, so `set-auth-token` never
+ * reaches the client and `getAuthToken()` stays null (see `src/ai/fetch.ts`):
+ * the socket arrives with only the carrier subprotocol. REST calls in that mode
+ * already authenticate with the session cookie, which the browser also sends
+ * on the WebSocket handshake.
+ *
+ * A cookie-authenticated WebSocket is open to cross-site hijacking, because a
+ * handshake isn't subject to CORS. So the cookie is only honoured when the
+ * handshake's `Origin` is exactly this deployment's own `appUrl` origin, which
+ * page JS on another site cannot forge. Only the `Cookie` header is forwarded,
+ * so this path can't be steered by any other request header.
+ */
+export const authorizeWsSameOriginCookie = async (
+  auth: Auth,
+  request: Request | undefined,
+  appUrl: string,
+): Promise<User | null> => {
+  const origin = request?.headers.get('origin')
+  const cookie = request?.headers.get('cookie')
+  if (!origin || !cookie || !URL.canParse(appUrl) || origin !== new URL(appUrl).origin) {
+    return null
+  }
+  const session = await auth.api.getSession({ headers: new Headers({ cookie }) })
+  const user = session?.user as User | undefined
+  if (!user || user.isAnonymous) {
+    return null
+  }
+  return user
+}

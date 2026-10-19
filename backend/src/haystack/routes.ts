@@ -4,7 +4,7 @@
 
 import { registerAgentProvider } from '@/agents'
 import type { Auth } from '@/auth/elysia-plugin'
-import { authorizeWsBearer, wsCloseUnauthorized } from '@/auth/ws-bearer-auth'
+import { authorizeWsBearer, authorizeWsSameOriginCookie, wsCloseUnauthorized } from '@/auth/ws-bearer-auth'
 import { createStandaloneLogger } from '@/config/logger'
 import type { Settings } from '@/config/settings'
 import { safeErrorHandler } from '@/middleware/error-handling'
@@ -61,7 +61,11 @@ export const createHaystackRoutes = (settings: Settings, auth: Auth, deps?: Hays
     // (browsers can't set `Authorization` on `new WebSocket()`); it is
     // verified via the same Better Auth path REST uses (HMAC + DB lookup).
     const subprotocolHeader = data.request?.headers.get('sec-websocket-protocol') ?? null
-    const user: User | null = await authorizeWsBearer(auth, subprotocolHeader)
+    // No bearer is the normal case after a web SSO sign-in; fall back to the
+    // session cookie, but only for a handshake from our own origin.
+    const user: User | null =
+      (await authorizeWsBearer(auth, subprotocolHeader)) ??
+      (await authorizeWsSameOriginCookie(auth, data.request, settings.appUrl))
     if (!user) {
       ws.close(wsCloseUnauthorized, 'unauthorized')
       return null
