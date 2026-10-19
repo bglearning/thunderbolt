@@ -14,12 +14,15 @@ import {
 import { createQueryTestWrapper } from '@/test-utils/react-query'
 import type { Model, ThunderboltUIMessage } from '@/types'
 import { act, cleanup, createEvent, fireEvent, render, screen } from '@testing-library/react'
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test'
 import { createElement, createRef, type ReactNode } from 'react'
 import { BrowserRouter } from 'react-router'
 import { useChatStore } from '@/chats/chat-store'
+import { useConfigStore } from '@/api/config-store'
 import { CreateItemProvider } from '@/components/create-item/context'
 import { getClock } from '@/testing-library'
+import { builtInAgent } from '@/defaults/agents'
+import type { Agent } from '@/types/acp'
 import { ChatPromptInput, type ChatPromptInputRef } from './chat-prompt-input'
 import type { ImageSupportCheck } from './use-image-support-check'
 
@@ -51,6 +54,27 @@ const createMockUseContextTracking =
     isLoading: false,
     estimateTokensForInput: (_input: string) => 0,
   })
+
+const remoteAcpAgent: Agent = {
+  ...builtInAgent,
+  id: 'remote-agent',
+  type: 'remote-acp',
+  transport: 'websocket',
+  url: 'wss://agent.example/ws',
+  isSystem: 0,
+  userId: 'user-1',
+}
+
+const hostedAgent: Agent = {
+  ...builtInAgent,
+  id: 'hosted-agent',
+  type: 'managed-http',
+  transport: 'http',
+  url: '/v1/agent/chat',
+}
+
+/** Skips the agent warm-up, which would otherwise open a real connection to a test agent's url. */
+const noWarmUp = () => {}
 
 const createMockUseIsMobile =
   (isMobile: boolean = false) =>
@@ -404,7 +428,7 @@ describe('ChatPromptInput', () => {
     const tokenText = 'run /Daily Brief now'
 
     /** Render with the chip skill in the library, seed the input, place the caret. */
-    const setupWithToken = (caret: number) => {
+    const setupWithToken = (caret: number, text = tokenText) => {
       const { mockUseChat } = setupStore()
       const ref = createRef<ChatPromptInputRef>()
       render(
@@ -418,7 +442,7 @@ describe('ChatPromptInput', () => {
         { wrapper: TestWrapper },
       )
       act(() => {
-        ref.current?.setInput(tokenText)
+        ref.current?.setInput(text)
       })
       const textarea = screen.getByPlaceholderText('Ask me anything…') as HTMLTextAreaElement
       textarea.setSelectionRange(caret, caret)
@@ -470,6 +494,43 @@ describe('ChatPromptInput', () => {
       expect(event.defaultPrevented).toBe(false)
       expect(textarea.value).toBe(tokenText)
     })
+
+    describe.each([
+      [false, true],
+      [true, false],
+    ])('slash commands, minimalMode: %s', (minimalMode, active) => {
+      beforeEach(() => {
+        useConfigStore.setState({ config: { minimalMode } })
+      })
+
+      it('opens the slash popup on `/` only when active', () => {
+        const textarea = setupWithToken(1, '/')
+        fireEvent.select(textarea)
+        expect(screen.queryByRole('listbox') !== null).toBe(active)
+      })
+
+      it('highlights a committed token only when active', () => {
+        setupWithToken(16)
+        expect(document.querySelector('.skill-token') !== null).toBe(active)
+      })
+
+      it('sends the token verbatim in minimal mode and normalized to the slug otherwise', async () => {
+        setupWithToken(16)
+        await act(async () => {
+          fireEvent.submit(document.querySelector('form')!)
+        })
+        const sent = useChatStore.getState().sessions.get('thread-1')!.chatInstance.sendMessage as ReturnType<
+          typeof mock
+        >
+        expect(sent.mock.calls[0][0].parts[0].text).toBe(active ? 'run /daily-brief now' : tokenText)
+      })
+
+      it('lets Backspace delete one character of a token only in minimal mode', () => {
+        const textarea = setupWithToken(16)
+        const event = pressBackspace(textarea)
+        expect(event.defaultPrevented).toBe(active)
+      })
+    })
   })
 
   describe('agent availability', () => {
@@ -483,6 +544,119 @@ describe('ChatPromptInput', () => {
 
       expect(screen.queryByPlaceholderText('Ask me anything…')).toBeNull()
       expect(screen.getByRole('status').textContent ?? '').toMatch(/not available on this platform/)
+    })
+  })
+
+  describe('no model fits the thread', () => {
+    /** Built-in agent on a non-private thread whose session holds `selectedModel`. */
+    const renderWithModel = (selectedModel: Model) => {
+      const { mockUseChat, mockChatInstance } = setupStore()
+      useChatStore.getState().updateSession('thread-1', { selectedModel })
+      const { container } = render(<ChatPromptInput useChat={mockUseChat} useIsMobile={createMockUseIsMobile()} />, {
+        wrapper: TestWrapper,
+      })
+      fireEvent.change(screen.getByPlaceholderText('Ask me anything…'), { target: { value: 'hello' } })
+      const submit = async () => {
+        await act(async () => {
+          fireEvent.submit(container.querySelector('form')!)
+        })
+      }
+      return { sendMessage: mockChatInstance.sendMessage, submit }
+    }
+
+    it('says why and holds the send instead of throwing on it', async () => {
+      const { sendMessage, submit } = renderWithModel(createMockModel({ isConfidential: 1 }))
+
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        'None of your models can be used in this chat. Choose another agent to send.',
+      )
+      await submit()
+      expect(sendMessage).not.toHaveBeenCalled()
+    })
+
+    it('clears the notice and selects a model once one that fits is added', async () => {
+      const confidentialModel = createMockModel({ isConfidential: 1 })
+      renderWithModel(confidentialModel)
+      expect(screen.getByRole('alert')).toBeInTheDocument()
+
+      const added = createMockModel({ id: 'added', provider: 'thunderbolt', isConfidential: 0 })
+      act(() => {
+        useChatStore.getState().setModels([confidentialModel, added])
+      })
+
+      expect(screen.queryByRole('alert')).toBeNull()
+      expect(useChatStore.getState().sessions.get('thread-1')?.selectedModel.id).toBe(added.id)
+    })
+
+    it('sends when the model matches the thread', async () => {
+      const { sendMessage, submit } = renderWithModel(createMockModel({ isConfidential: 0 }))
+
+      expect(screen.queryByRole('alert')).toBeNull()
+      await submit()
+      expect(sendMessage).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('private chat held back from a non-built-in agent', () => {
+    const notice = "This private chat won't run on Assistant. Switch to Thunderbolt to run it."
+
+    /** An automation thread: private, ending on its unanswered prompt, resolved to `agent`. */
+    const renderAutomationThread = ({ isEncrypted = 1 }: { isEncrypted?: 0 | 1 } = {}) => {
+      const { mockUseChat, mockChatInstance } = setupStore('ready', [
+        { id: 'msg-1', role: 'user', parts: [{ type: 'text', text: 'Daily brief' }] },
+      ])
+      act(() => {
+        useChatStore.getState().updateSession('thread-1', {
+          chatThread: createMockChatThread({ isEncrypted }),
+          selectedAgent: { ...hostedAgent, name: 'Assistant' },
+        })
+      })
+      const { container } = render(
+        <ChatPromptInput useChat={mockUseChat} useIsMobile={createMockUseIsMobile()} useWarmAcpCommands={noWarmUp} />,
+        { wrapper: TestWrapper },
+      )
+      return { container, sendMessage: mockChatInstance.sendMessage }
+    }
+
+    afterEach(() => {
+      useConfigStore.setState({ config: {} })
+    })
+
+    it('says so and holds typed and voice sends, which would carry the history out unencrypted', async () => {
+      const { container, sendMessage } = renderAutomationThread()
+
+      expect(screen.getByText(notice)).toBeInTheDocument()
+      // Voice sends straight through the chat, so it is held here too.
+      expect(screen.getByRole('button', { name: 'Start voice mode' })).toBeDisabled()
+
+      fireEvent.change(screen.getByPlaceholderText('Ask me anything…'), { target: { value: 'Go on' } })
+      await act(async () => {
+        fireEvent.submit(container.querySelector('form')!)
+      })
+      expect(sendMessage).not.toHaveBeenCalled()
+    })
+
+    it('clears once the chat is back on the built-in agent', () => {
+      renderAutomationThread()
+
+      act(() => {
+        useChatStore.getState().updateSession('thread-1', { selectedAgent: builtInAgent })
+      })
+
+      expect(screen.queryByText(notice)).toBeNull()
+    })
+
+    it('drops the switch advice where the deployment has no built-in agent', () => {
+      useConfigStore.setState({ config: { builtInAgentEnabled: false } })
+      renderAutomationThread()
+
+      expect(screen.getByText("This private chat won't run on Assistant.")).toBeInTheDocument()
+    })
+
+    it('stays quiet for a chat that is not private', () => {
+      renderAutomationThread({ isEncrypted: 0 })
+
+      expect(screen.queryByText(notice)).toBeNull()
     })
   })
 
@@ -537,6 +711,48 @@ describe('ChatPromptInput', () => {
 
       expect(screen.queryByRole('status')).toBeNull()
       expect(screen.queryByRole('alert')).toBeNull()
+    })
+  })
+
+  describe('attach control', () => {
+    const openAddMenu = () =>
+      fireEvent.pointerDown(screen.getByRole('button', { name: 'Add to chat' }), { button: 0, ctrlKey: false })
+
+    it.each([
+      ['the built-in agent', builtInAgent],
+      ['an ACP agent', remoteAcpAgent],
+    ])('offers Upload file for %s', async (_label, agent) => {
+      // A real connection to the test agent's url fails asynchronously and poisons later tests.
+      const openSocket = spyOn(globalThis, 'WebSocket')
+      const { mockUseChat } = setupStore()
+      useChatStore.getState().updateSession('thread-1', { selectedAgent: agent })
+      render(
+        <ChatPromptInput useChat={mockUseChat} useIsMobile={createMockUseIsMobile()} useWarmAcpCommands={noWarmUp} />,
+        { wrapper: TestWrapper },
+      )
+
+      openAddMenu()
+
+      expect(screen.getByRole('menuitem', { name: 'Upload file' })).toBeInTheDocument()
+      await act(async () => {
+        await getClock().runAllAsync()
+      })
+      expect(openSocket).not.toHaveBeenCalled()
+      openSocket.mockRestore()
+    })
+
+    it('hides Upload file for the hosted agent, which takes no attachments', () => {
+      const { mockUseChat } = setupStore()
+      useChatStore.getState().updateSession('thread-1', { selectedAgent: hostedAgent })
+      render(
+        <ChatPromptInput useChat={mockUseChat} useIsMobile={createMockUseIsMobile()} useWarmAcpCommands={noWarmUp} />,
+        { wrapper: TestWrapper },
+      )
+
+      openAddMenu()
+
+      expect(screen.getByRole('menuitem', { name: 'Connections' })).toBeInTheDocument()
+      expect(screen.queryByRole('menuitem', { name: 'Upload file' })).toBeNull()
     })
   })
 
@@ -616,6 +832,91 @@ describe('ChatPromptInput', () => {
       await flushAttachments()
 
       expect(screen.getByText(/isn't a supported file type/)).toBeInTheDocument()
+    })
+
+    it('lets a file paste fall through untouched for the hosted agent', async () => {
+      const { mockUseChat } = setupStore()
+      useChatStore.getState().updateSession('thread-1', { selectedAgent: hostedAgent })
+      render(
+        <ChatPromptInput useChat={mockUseChat} useIsMobile={createMockUseIsMobile()} useWarmAcpCommands={noWarmUp} />,
+        { wrapper: TestWrapper },
+      )
+
+      const textarea = screen.getByPlaceholderText('Ask me anything…') as HTMLTextAreaElement
+      const file = new File(['data'], 'shot.png', { type: 'image/png' })
+      const preventDefaultSpy = pasteItems(textarea, [{ kind: 'file', type: 'image/png', getAsFile: () => file }])
+      await flushAttachments()
+
+      expect(preventDefaultSpy).not.toHaveBeenCalled()
+      expect(screen.queryByLabelText('Remove shot.png')).toBeNull()
+    })
+
+    it.each([
+      ['the hosted agent', hostedAgent, false],
+      ['the built-in agent', builtInAgent, true],
+    ])('on a file drop, %s attaches it: %p', async (_label, agent, attaches) => {
+      const { mockUseChat } = setupStore()
+      useChatStore.getState().updateSession('thread-1', { selectedAgent: agent })
+      render(
+        <ChatPromptInput useChat={mockUseChat} useIsMobile={createMockUseIsMobile()} useWarmAcpCommands={noWarmUp} />,
+        { wrapper: TestWrapper },
+      )
+
+      const textarea = screen.getByPlaceholderText('Ask me anything…')
+      const file = new File(['data'], 'dropped.png', { type: 'image/png' })
+      fireEvent.dragOver(textarea)
+      expect(screen.queryByText('Drop file to attach') !== null).toBe(attaches)
+      fireEvent.drop(textarea, { dataTransfer: { files: [file] } })
+      await flushAttachments()
+
+      expect(screen.queryByLabelText('Remove dropped.png') !== null).toBe(attaches)
+    })
+
+    describe('files queued before the chat moved to the hosted agent', () => {
+      /** Queue an image on the built-in agent, then move the chat onto the hosted agent. */
+      const renderWithQueuedImageOnHostedAgent = async () => {
+        const { mockUseChat, mockChatInstance } = setupStore()
+        const { container } = render(
+          <ChatPromptInput useChat={mockUseChat} useIsMobile={createMockUseIsMobile()} useWarmAcpCommands={noWarmUp} />,
+          { wrapper: TestWrapper },
+        )
+        const textarea = screen.getByPlaceholderText('Ask me anything…') as HTMLTextAreaElement
+        const file = new File(['data'], 'queued.png', { type: 'image/png' })
+        pasteItems(textarea, [{ kind: 'file', type: 'image/png', getAsFile: () => file }])
+        await flushAttachments()
+        fireEvent.change(textarea, { target: { value: 'What is in this picture?' } })
+        act(() => {
+          useChatStore.getState().updateSession('thread-1', { selectedAgent: hostedAgent })
+        })
+        const submit = async () => {
+          await act(async () => {
+            fireEvent.submit(container.querySelector('form')!)
+          })
+        }
+        return { sendMessage: mockChatInstance.sendMessage, submit }
+      }
+
+      it('keeps the queued file visible, says why, and holds the send', async () => {
+        const { sendMessage, submit } = await renderWithQueuedImageOnHostedAgent()
+
+        expect(screen.getByLabelText('Remove queued.png')).toBeInTheDocument()
+        expect(screen.getByRole('alert')).toHaveTextContent(
+          `${hostedAgent.name} can't take attachments. Remove the attached files to send.`,
+        )
+        await submit()
+        expect(sendMessage).not.toHaveBeenCalled()
+      })
+
+      it('sends again once the queued file is removed', async () => {
+        const { sendMessage, submit } = await renderWithQueuedImageOnHostedAgent()
+
+        fireEvent.click(screen.getByLabelText('Remove queued.png'))
+        await flushAttachments()
+
+        expect(screen.queryByRole('alert')).toBeNull()
+        await submit()
+        expect(sendMessage).toHaveBeenCalledTimes(1)
+      })
     })
 
     describe('image support gate', () => {

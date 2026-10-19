@@ -4,6 +4,7 @@
 
 import type { ConsoleSpies } from '@/test-utils/console-spies'
 import { setupConsoleSpy } from '@/test-utils/console-spies'
+import { createRejectingRateLimit } from '@/test-utils/rate-limit'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, mock } from 'bun:test'
 import { Elysia } from 'elysia'
 import { createUniversalProxyRoutes } from './routes'
@@ -617,18 +618,12 @@ describe('createUniversalProxyRoutes', () => {
   // ---------------------------------------------------------------------------
 
   it('returns 429 when rate limit is exceeded', async () => {
-    const rateLimitPlugin = new Elysia()
-      .onBeforeHandle(({ set }) => {
-        set.status = 429
-        set.headers['Retry-After'] = '60'
-        return { error: 'Too many requests' }
-      })
-      .as('scoped')
+    const { rateLimit } = createRejectingRateLimit()
     const rateLimitedApp = new Elysia().use(
       createUniversalProxyRoutes({
         auth: fakeAuth,
         fetchFn: mockFetch as unknown as typeof fetch,
-        rateLimit: rateLimitPlugin,
+        rateLimit,
         dnsLookup: mockDnsLookup,
       }),
     )
@@ -728,6 +723,19 @@ describe('createUniversalProxyRoutes', () => {
     await drain(await app.handle(proxyRequest(target, { method: 'GET' })))
     const [, init] = mockFetch.mock.calls[0] as [string, RequestInit & { decompress?: boolean }]
     expect(init.decompress).toBe(false)
+  })
+
+  it('names the original hostname of each hop as TLS SNI, since the pinned URL carries an IP', async () => {
+    mockFetch
+      .mockImplementationOnce(() =>
+        Promise.resolve(new Response(null, { status: 302, headers: { location: 'https://other.example/next' } })),
+      )
+      .mockImplementationOnce(() => Promise.resolve(makeOkResponse()))
+    await drain(await app.handle(proxyRequest('https://example.com/resource', { method: 'GET' })))
+    const serverNames = (mockFetch.mock.calls as Array<[string, BunFetchRequestInit]>).map(
+      ([, init]) => init.tls?.serverName,
+    )
+    expect(serverNames).toEqual(['example.com', 'other.example'])
   })
 
   it('forwards upstream `content-encoding` response header to the caller (no longer dropped)', async () => {

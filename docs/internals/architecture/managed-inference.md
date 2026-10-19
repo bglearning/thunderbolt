@@ -1,6 +1,6 @@
 # Managed Inference
 
-Most models are bring-your-own-key: the credential lives on the device and the universal proxy forwards it ([`src/lib/proxy-fetch.ts`](../../../src/lib/proxy-fetch.ts)). **Managed inference** is the other path, where the deployment holds the credential and any signed-in user (including an anonymous session) chats unconfigured. Every managed request is priced and quota-checked before reaching an upstream.
+Most models are bring-your-own-key: the credential lives on the device and the universal proxy forwards it ([`src/lib/proxy-fetch.ts`](../../../src/lib/proxy-fetch.ts)). **Managed inference** is the other path, where the deployment holds the credential and any signed-in user (including an anonymous session) chats unconfigured. Every managed request is priced and quota-checked before reaching an upstream; a hosted-agent run that calls tools is checked once, before its first step.
 
 | Tier             | Route           | Credential          | What the server sees                                                            | Metering                                                |
 | ---------------- | --------------- | ------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------- |
@@ -26,7 +26,7 @@ Three models ship as reconciled defaults in [`shared/defaults/models.ts`](../../
 
 ## Admission: price first, then quota
 
-Both tiers call `checkManagedInferenceAdmission` (`usage-ledger.ts:157`) before any upstream request. Price and spend load concurrently; price failures win, so a missing price row reports configuration, not quota.
+Both tiers call `checkManagedInferenceAdmission` (`usage-ledger.ts:180`) before any upstream request. Price and spend load concurrently; price failures win, so a missing price row reports configuration, not quota.
 
 | Outcome             | Status | Body                                                               |
 | ------------------- | ------ | ------------------------------------------------------------------ |
@@ -43,7 +43,7 @@ Bodies come from [`usage-responses.ts`](../../../backend/src/inference/usage-res
 - **A new managed model needs a price migration** and its `backend/drizzle/meta/_journal.json` entry. Drizzle finds migrations through the journal; an unlisted SQL file never runs.
 - Catalog in TypeScript, prices in Postgres, so drift runs one way: the model ships, the price does not, every request 503s.
 - Prices are quota weighting, not billing. 0029 sets GLM 5.3 to `1500 / 5250`, glm-5-2's numbers rather than Tinfoil's list `1800 / 5750`, so a model swap does not change how fast users burn their allowance.
-- `calculateInferenceCost` (`usage-ledger.ts:78`) applies Anthropic prompt-cache multipliers (5-minute write ×1.25, 1-hour write ×2, cache read ×0.1) only when `provider === 'anthropic'`; the confidential receipt contract has no cache fields ([`shared/inference-usage.ts:9`](../../../shared/inference-usage.ts)).
+- `calculateInferenceCost` (`usage-ledger.ts:101`) applies Anthropic's cache-write multipliers (5-minute ×1.25, 1-hour ×2) only when `provider === 'anthropic'`. Cache reads bill at the row's nullable `cache_read_nano_usd_per_token` when it is set, for any provider; a null rate falls back to ×0.1 of input for Anthropic and to the full input rate for everyone else. Migration `0037` sets it for the two Fireworks rows; the Anthropic rows leave it null. The confidential receipt contract has no cache fields ([`shared/inference-usage.ts:9`](../../../shared/inference-usage.ts)).
 - Cache tokens above the prompt-token total, or a cost above Postgres `bigint` max, throw (`InferenceTokenCountOutOfRangeError` / `InferenceCostOverflowError`).
 
 ### The two rolling windows
@@ -55,9 +55,9 @@ Defaults, overridden by the `INFERENCE_QUOTA_*` knobs:
 | 5 h    | 10¢               | 1500¢              |
 | 7 d    | 60¢               | 7500¢              |
 
-- `checkInferenceQuota` (`usage-ledger.ts:127`) sums `inference_usage.cost_nano_usd` over both windows in one aggregate using Postgres's own `now()`, keeping windows consistent across replicas.
-- Limits are integer cents, split anonymous from registered (`getInferenceQuotaLimits`, `usage-ledger.ts:184`), because anonymous sessions are free to create. Knobs: [configuration.md](../../self-hosting/configuration.md#managed-inference-quotas).
-- The ledger insert is idempotent on the event id (`onConflictDoNothing`, `usage-ledger.ts:120`), returning `'inserted'` or `'duplicate'`. That makes receipt retries safe.
+- `checkInferenceQuota` (`usage-ledger.ts:150`) sums `inference_usage.cost_nano_usd` over both windows in one aggregate using Postgres's own `now()`, keeping windows consistent across replicas.
+- Limits are integer cents, split anonymous from registered (`getInferenceQuotaLimits`, `usage-ledger.ts:207`), because anonymous sessions are free to create. Knobs: [configuration.md](../../self-hosting/configuration.md#managed-inference-quotas).
+- The ledger insert is idempotent on the event id (`onConflictDoNothing`, `usage-ledger.ts:143`), returning `'inserted'` or `'duplicate'`. That makes receipt retries safe.
 
 ## Direct tier: `/v1/chat/*`
 
@@ -66,26 +66,26 @@ Defaults, overridden by the `INFERENCE_QUOTA_*` knobs:
 | `POST /v1/chat/completions` | OpenAI             | streaming only                                                                                                    |
 | `POST /v1/chat/v1/messages` | Anthropic Messages | streaming only; Zod-validated, Anthropic-specific fields passed through as `unknown` for the upstream to validate |
 
-[`backend/src/inference/routes.ts`](../../../backend/src/inference/routes.ts) mounts both under `prefix: '/chat'`; `/v1` comes from the app mount in `backend/src/index.ts`. Both sit behind `createMeteredRouteGuard` ([`metered-route-guard.ts`](../../../backend/src/inference/metered-route-guard.ts)), as does the hosted agent's `POST /v1/agent/chat`: a session, the CLI device binding, then the `inference` rate limit. Only slugs in `managedDirectRuntimes` are accepted, today `opus-5-5`.
+[`backend/src/inference/routes.ts`](../../../backend/src/inference/routes.ts) mounts both under `prefix: '/chat'`; `/v1` comes from the app mount in `backend/src/index.ts`. Both sit behind `createMeteredRouteGuard` ([`metered-route-guard.ts`](../../../backend/src/inference/metered-route-guard.ts)), the guard in front of every managed-inference route: a session, personal access tokens allowed, the CLI device binding, then the `inference` rate limit. Only slugs in `managedDirectRuntimes` are accepted, today `opus-5-5`.
 
 - Messages adds request-level `cache_control: { type: 'ephemeral' }` to the upstream body; Anthropic moves that breakpoint to the last cacheable block each turn, coexisting with the Pi harness's per-block breakpoints.
 - `sanitizeMessageRoles` downgrades `developer` and `system` to `user` on the completions route for every message but the first, blocking a smuggled second system prompt. Messages needs no equivalent: its system prompt is a separate field.
-- `createUsageCallbacks` ([`managed-request.ts`](../../../backend/src/inference/managed-request.ts)) writes the ledger row at the admitted price in the SSE `onUsage`; `onUsageMissing` / `onUsageError` log upstreams with no usage block. The hosted agent drives the same callbacks from the AI SDK's `onFinish` through `recordLanguageModelUsage`.
+- `createUsageCallbacks` ([`managed-request.ts`](../../../backend/src/inference/managed-request.ts)) writes the ledger row at the admitted price in the SSE `onUsage`; `onUsageMissing` / `onUsageError` log upstreams with no usage block. The hosted agent drives the same callbacks from the AI SDK's `onFinish` through `recordLanguageModelUsage`. A run that a client disconnect or its upstream timeout aborts usually ends before the provider's final usage chunk (Fireworks reports usage only there), so it is billed by estimate once the stream settles (`getAbortedRunCounts`, [`hosted-agent/usage-estimate.ts`](../../../backend/src/hosted-agent/usage-estimate.ts)). The steps it finished are billed at the usage they reported, from the `steps` `onAbort` receives; only the step in flight is estimated. A step stays in flight until its tool calls settle, so an abort while a tool runs estimates the step that called it. The estimate counts one token per Han, Hiragana, Katakana or Hangul code point plus `ceil(chars / 3)` of the remaining text. For prompt tokens it reads the system prompt, the tool definitions (none for the final step, which offers no tools and carries the final-step nudge instead) and the JSON-serialized messages, earlier steps' tool calls and results included; for completion tokens, the text, reasoning and tool-call input that step streamed. Cache tokens are zero. Three characters a token rather than the usual four errs high for alphabetic text, and CJK, which tokenizes at roughly one token per one to one and a half characters, is counted one for one so it is not undercharged up to threefold; either way a client that aborts every run cannot spend past its quota. A run whose later step fails upstream reports no total, so it is billed at what its finished steps reported (`getSettledRunCounts`). If the abort lands after the run's last step and the provider's usage arrived, that is billed instead, once. `inference_usage` has no column marking an estimated row; the `agent_usage_estimated` log line (reason, prompt and completion counts) is the only record that a row is one.
 - Telemetry is body-free: status, model, provider, error kind, token counts, never content (`posthog-privacy.test.ts` pins this).
 - **Client routing.** Managed rows with `vendor: 'anthropic'` route to Messages (`src/acp/built-in-adapter.ts:449`) via `resolveManagedAnthropicConnection` ([`src/ai/fetch.ts:328`](../../../src/ai/fetch.ts)), shared by the legacy AI-SDK path and the Pi harness so they cannot drift. It deletes the `x-api-key` the Anthropic SDK insists on writing and re-sends the value as `Authorization: Bearer`: the backend authenticates the app session, not an Anthropic key. The `thunderbolt` placeholder for a missing bearer under SSO cookie auth is dropped, not promoted (`fetch.ts:272-284`).
 - **No configuration pre-check here.** Without `ANTHROPIC_API_KEY`, admission passes and the client factory throws (`createManagedProviderConnection` in `client.ts`) as a 500; the confidential route answers a clean 503.
 
 ## Confidential tier: `/v1/tinfoil/*`
 
-[`backend/src/tinfoil/routes.ts`](../../../backend/src/tinfoil/routes.ts) is a pass-through, not a client. `{ parse: 'none' }` (L460) keeps the HPKE-sealed request byte-for-byte; `decompress: false` (L312) keeps response bytes opaque for the frontend SDK. `GET`, `POST` and `OPTIONS` only, else 405; a missing `TINFOIL_API_KEY` is 503 `Tinfoil provider not configured`.
+[`backend/src/tinfoil/routes.ts`](../../../backend/src/tinfoil/routes.ts) is a pass-through, not a client. `{ parse: 'none' }` (L451) keeps the HPKE-sealed request byte-for-byte; `decompress: false` (L306) keeps response bytes opaque for the frontend SDK. `GET`, `POST` and `OPTIONS` only, else 405; a missing `TINFOIL_API_KEY` is 503 `Tinfoil provider not configured`.
 
-- **The header blocklist (L41-53) is a security boundary.** `authorization`, `x-api-key`, `host`, `cookie`, `x-app-version`, `x-app-language`, the device headers and `X-Inference-Model` are dropped before `Authorization: Bearer <TINFOIL_API_KEY>` is injected. The session credential must never reach the enclave, nor the enclave's key the client.
-- **`X-Tinfoil-Enclave-Url` is client-supplied and guarded.** Tinfoil's ATC picks the enclave whose HPKE key sealed the body, so the client names it. `resolveEnclaveUrl` (L105) accepts only HTTPS `tinfoil.sh` hosts, else 400. That is the SSRF guard.
-- **Upstream CORS headers are stripped (L317-326)**: the enclave emits a duplicated `Access-Control-Allow-Credentials: true, true` that browsers reject. The backend's own `cors()` sets the correct ones.
-- **Only chat is metered**: a `POST` whose decoded upstream path is `/v1/chat/completions` (L244-245). Voice rides the same attested route ([`thunderbolt-engine.ts`](../../../src/voice/engine/thunderbolt-engine.ts)) over `/audio/transcriptions` and `/audio/speech` ([`audio-engine.ts:110`, `:140`](../../../src/voice/engine/audio-engine.ts)), neither quota-checked nor charged. Another metered path means extending that condition, not just the client.
-- **The model comes from a header.** The body is sealed, so the client sends `X-Inference-Model` ([`shared/inference-usage.ts:5`](../../../shared/inference-usage.ts)). Unrecognized is 400 before the enclave; _absent_ prices as `glm-5-3` (L247-249) for clients predating the header.
+- **The header blocklist (L35-47) is a security boundary.** `authorization`, `x-api-key`, `host`, `cookie`, `x-app-version`, `x-app-language`, the device headers and `X-Inference-Model` are dropped before `Authorization: Bearer <TINFOIL_API_KEY>` is injected. The session credential must never reach the enclave, nor the enclave's key the client.
+- **`X-Tinfoil-Enclave-Url` is client-supplied and guarded.** Tinfoil's ATC picks the enclave whose HPKE key sealed the body, so the client names it. `resolveEnclaveUrl` (L99) accepts only HTTPS `tinfoil.sh` hosts, else 400. That is the SSRF guard.
+- **Upstream CORS headers are stripped (L311-320)**: the enclave emits a duplicated `Access-Control-Allow-Credentials: true, true` that browsers reject. The backend's own `cors()` sets the correct ones.
+- **Only chat is metered**: a `POST` whose decoded upstream path is `/v1/chat/completions` (L247-248). Voice rides the same attested route ([`thunderbolt-engine.ts`](../../../src/voice/engine/thunderbolt-engine.ts)) over `/audio/transcriptions` and `/audio/speech` ([`audio-engine.ts:110`, `:140`](../../../src/voice/engine/audio-engine.ts)), neither quota-checked nor charged. Another metered path means extending that condition, not just the client.
+- **The model comes from a header.** The body is sealed, so the client sends `X-Inference-Model` ([`shared/inference-usage.ts:5`](../../../shared/inference-usage.ts)). Unrecognized is 400 before the enclave; _absent_ prices as `glm-5-3` (L250-252) for clients predating the header.
 - **The prompt-cache secret is not ours to see.** The enclave partitions its cache by a client-generated 32-byte `userCacheSecret` ([`src/lib/auth-token.ts:61`](../../../src/lib/auth-token.ts) in the app, `randomBytes(32)` in the CLI), sent to the attested enclave, never the backend.
-- **A personal access token is refused by default.** `x-api-key` gets 403 `WEB_LOGIN_REQUIRED` unless `CONFIDENTIAL_API_KEYS_ENABLED=true` ([`web-session.ts:24`](../../../backend/src/inference/web-session.ts)); its JSDoc and [pat-lifecycle.md](../../../backend/docs/pat-lifecycle.md) explain why this is authorization, not cryptography. Under `CLI_DEVICE_REGISTRATION_ENABLED`, a CLI-device-grant session must also match a live, unrevoked `cli` device row or get 409 `CLI_DEVICE_NOT_BOUND` ([`cli-device.ts`](../../../backend/src/inference/cli-device.ts)), on `/v1/chat/*` and the receipt route too.
+- **A personal access token is refused by default.** `x-api-key` gets 403 `WEB_LOGIN_REQUIRED` unless `CONFIDENTIAL_API_KEYS_ENABLED=true` ([`web-session.ts:24`](../../../backend/src/inference/web-session.ts)); its JSDoc and [pat-lifecycle.md](../../../backend/docs/pat-lifecycle.md) explain why this is authorization, not cryptography. Under `CLI_DEVICE_REGISTRATION_ENABLED`, a CLI-device-grant session must also match a live, unrevoked `cli` device row or get 409 `CLI_DEVICE_NOT_BOUND` ([`cli-device.ts`](../../../backend/src/inference/cli-device.ts)), as on every route behind `createMeteredRouteGuard`. Here the guard sets `allowPersonalAccessTokens` from that flag and applies the `pro` rate limit.
 - **Attestation is slow, so the pool is kept warm.** `createTinfoilKeepWarm` ([`keep-warm.ts`](../../../backend/src/tinfoil/keep-warm.ts)) issues `GET /models` every 60 s against the last-used enclave origin, no-ops without `TINFOIL_API_KEY`, and logs failures at debug without affecting availability. Constructed `index.ts:215`, started `:259`, stopped `:274`.
 
 Client-side attestation and caching live in [`src/ai/tinfoil-client.ts`](../../../src/ai/tinfoil-client.ts): one cached `SecureClient` per kind (`system` keyed by cloud URL, `user` for BYOK Tinfoil keys), a 15-second bound on the SDK's non-abortable `ready()`, eviction of the failed generation only, and `isTinfoilTransportWedgedError` for failures needing a fresh client.
@@ -99,11 +99,11 @@ A receipt is the backend telling itself, through the client, what it already dec
 - Signed claims: `eventId`, `userId`, `provider`, `model`, both per-token prices, `issuedAt`/`expiresAt`. Two-hour lifetime (L19), 60 s future skew tolerated (L20, L107).
 - The HMAC key derives from `BETTER_AUTH_SECRET` under `thunderbolt/inference-usage-receipt/key/v1` (L18, L42-45), so it is not the session key.
 - Verification is constant-time and re-validates the claim schema after the signature, including that the model is still a recognized confidential one.
-- **Token counts are not signed** and cannot be: only the client can read the enclave's response. The server fixes _who_, _what_ and _at what price_; the client reports _how much_. It can under-report itself, not bill another account (a `userId` mismatch is 403, `usage-receipt-routes.ts:114`) or invent a price.
+- **Token counts are not signed** and cannot be: only the client can read the enclave's response. The server fixes _who_, _what_ and _at what price_; the client reports _how much_. It can under-report itself, not bill another account (a `userId` mismatch is 403, `usage-receipt-routes.ts:89`) or invent a price.
 
-**Transport.** The `X-Inference-Usage-Receipt` response header, set only on upstream success and stripped from the upstream headers first (`tinfoil/routes.ts:321-328`) so the enclave cannot forge one. It is in `defaultCorsExposeHeaders` (`backend/src/config/settings.ts:11`); browsers expose only listed headers cross-origin, so removing it silently stops all browser-side metering.
+**Transport.** The `X-Inference-Usage-Receipt` response header, set only on upstream success and stripped from the upstream headers first (`tinfoil/routes.ts:315-322`) so the enclave cannot forge one. It is in `defaultCorsExposeHeaders` (`backend/src/config/settings.ts:11`); browsers expose only listed headers cross-origin, so removing it silently stops all browser-side metering.
 
-**`POST /v1/inference-usage/receipts`** ([`usage-receipt-routes.ts`](../../../backend/src/inference/usage-receipt-routes.ts)) parses the body by hand under `parse: 'none'`, 4096-byte cap. All responses are body-free:
+**`POST /v1/inference-usage/receipts`** ([`usage-receipt-routes.ts`](../../../backend/src/inference/usage-receipt-routes.ts)) reads the body through `readBoundedJson` under `parse: 'none'`, 4096-byte cap; an oversized body, or one whose stream fails mid-read, is the same empty 400 as a malformed one. The handler's own responses are body-free; the guard's 401, 403, 409 and 429 carry their usual bodies:
 
 | Status | Meaning                                                     |
 | ------ | ----------------------------------------------------------- |
@@ -157,6 +157,7 @@ Retiring a model is a one-way door. `cleanupRemovedDefaults` soft-deletes every 
 | Variable                        | Enables                                                         |
 | ------------------------------- | --------------------------------------------------------------- |
 | `ANTHROPIC_API_KEY`             | the direct tier (`/v1/chat/*`)                                  |
+| `FIREWORKS_API_KEY`             | the hosted agent, when `AGENT_MODEL` is a Fireworks model       |
 | `TINFOIL_API_KEY`               | the confidential tier (`/v1/tinfoil/*`) and the keep-warm probe |
 | `TINFOIL_ENCLAVE_URL`           | enclave base URL; must include the `/v1` prefix                 |
 | `CONFIDENTIAL_API_KEYS_ENABLED` | lets a PAT reach the confidential routes                        |
@@ -171,11 +172,11 @@ Full descriptions: [configuration.md](../../self-hosting/configuration.md#ai-pro
 | Path                                            | Role                                                                  |
 | ----------------------------------------------- | --------------------------------------------------------------------- |
 | `backend/src/inference/routes.ts`               | direct tier: `/chat/completions`, `/chat/v1/messages`                 |
-| `backend/src/inference/managed-models.ts`       | public slug → upstream identity, for both tiers                       |
+| `backend/src/inference/managed-models.ts`       | public slug → upstream identity, for both tiers and the hosted agent  |
 | `backend/src/inference/usage-ledger.ts`         | price lookup, cost math, rolling windows, admission, ledger insert    |
 | `backend/src/inference/usage-responses.ts`      | the stable 503 / 429 bodies                                           |
-| `backend/src/inference/managed-request.ts`      | admission and ledger-write callbacks, shared with the hosted agent    |
-| `backend/src/inference/metered-route-guard.ts`  | session, CLI-binding and rate-limit guard for the direct routes       |
+| `backend/src/inference/managed-request.ts`      | admission for both tiers, and the ledger-write callbacks              |
+| `backend/src/inference/metered-route-guard.ts`  | session, PAT, CLI-binding and rate-limit guard for metered routes     |
 | `backend/src/inference/usage-receipt.ts`        | receipt issue and verify                                              |
 | `backend/src/inference/usage-receipt-routes.ts` | `POST /v1/inference-usage/receipts`                                   |
 | `backend/src/inference/web-session.ts`          | the PAT gate on confidential routes                                   |

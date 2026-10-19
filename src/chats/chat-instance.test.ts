@@ -15,13 +15,14 @@ import { setDebugTranscriptCaptureEnabled } from '@/debug-transcript/recorder'
 import { builtInAgent } from '@/defaults/agents'
 import type { HttpClient } from '@/lib/http'
 import type { FetchFn } from '@/lib/proxy-fetch'
-import { createMockChatInstance, hydrateStore, resetStore } from '@/test-utils/chat-store-mocks'
+import { createMockChatInstance, createMockChatThread, hydrateStore, resetStore } from '@/test-utils/chat-store-mocks'
 import { getClock } from '@/testing-library'
 import type { SaveMessagesFunction, ThunderboltUIMessage } from '@/types'
 import type { Agent, AgentAdapter, AgentAdapterContext } from '@/types/acp'
 import type { RequestPermissionResponse } from '@agentclientprotocol/sdk'
 import type { ChatInit, ChatOnFinishCallback } from 'ai'
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test'
+import { useConfigStore } from '@/api/config-store'
 import { useChatStore } from './chat-store'
 import { createAgentRoutingFetch, createChatInstance, type CreateChatInstanceDeps } from './chat-instance'
 import { getTurnActivity } from './turn-activity'
@@ -240,6 +241,37 @@ describe('createAgentRoutingFetch — connection status', () => {
       },
     })
   })
+
+  it.each([
+    [false, ['WEATHER_BODY']],
+    [true, []],
+  ])(
+    'resolves a /weather token for a non-built-in agent only outside minimal mode (%s)',
+    async (minimalMode, expected) => {
+      useConfigStore.setState({ config: { minimalMode } })
+      const remote: Agent = { ...builtInAgent, id: 'remote', type: 'managed-http' }
+      useChatStore.getState().updateSession(sessionId, { selectedAgent: remote })
+      const seen: Array<string[] | undefined> = []
+      const adapter: AgentAdapter = {
+        ...makeAdapter(remote),
+        fetch: async (_init, context) => {
+          seen.push(context.skillInstructions)
+          return new Response('ok')
+        },
+      }
+      const fetch = createAgentRoutingFetch(sessionId, async () => {}, httpClient, getProxyFetch, {
+        getOrConnectAdapter: async () => adapter,
+        getAllSkills: (async () => [{ name: 'weather', instruction: 'WEATHER_BODY', enabled: 1 }]) as never,
+        getDb: (() => ({})) as never,
+      })
+      await fetch('https://x', {
+        body: JSON.stringify({
+          messages: [{ id: 'u', role: 'user', parts: [{ type: 'text', text: '/weather today' }] }],
+        }),
+      })
+      expect(seen[0] ?? []).toEqual(expected)
+    },
+  )
 
   it('transitions connecting → ready when connectToAgent resolves', async () => {
     const observed: string[] = []
@@ -805,6 +837,30 @@ describe('createChatInstance — retry policy', () => {
     }
   })
 
+  it('retries a hosted-agent turn refused for a run in progress, after a longer delay', async () => {
+    const random = spyOn(Math, 'random').mockReturnValue(0.5)
+    const errorLog = spyOn(console, 'error').mockImplementation(() => {})
+    const { finishWithError, regenerate } = createRetryHarness()
+    const runInProgress = JSON.stringify({
+      error: JSON.stringify({ error: { code: 'AGENT_RUN_IN_PROGRESS' } }),
+      status: 429,
+      kind: 'rate-limit',
+    })
+
+    try {
+      await finishWithError(new Error(runInProgress))
+      await getClock().tickAsync(9_999)
+      expect(regenerate).not.toHaveBeenCalled()
+
+      await getClock().tickAsync(1)
+      expect(regenerate).toHaveBeenCalledTimes(1)
+      expect(useChatStore.getState().sessions.get(sessionId)!.retryCount).toBe(1)
+    } finally {
+      random.mockRestore()
+      errorLog.mockRestore()
+    }
+  })
+
   it('manual regenerate resets the turn budget', async () => {
     const { getTurnBudget, instance, regenerate, wakeAdapterReconnect } = createRetryHarness()
     const exhaustedBudget = exhaustTurnBudget(getTurnBudget())
@@ -816,6 +872,27 @@ describe('createChatInstance — retry policy', () => {
     expect(getTurnBudget().consumer.tryConsumeRequest()).toBe(true)
     expect(regenerate).toHaveBeenCalledTimes(1)
     expect(wakeAdapterReconnect).toHaveBeenCalledWith(builtInAgent.id)
+  })
+
+  it.each([
+    ['the built-in agent', builtInAgent, true],
+    ['the hosted agent, which ignores the selected model', { ...builtInAgent, type: 'managed-http' } as Agent, false],
+  ])("enforces a private chat's model lock for %s: %p", async (_label, agent, enforced) => {
+    const { instance, sendMessage } = createRetryHarness()
+    useChatStore.getState().updateSession(sessionId, {
+      selectedAgent: agent,
+      chatThread: createMockChatThread({ id: sessionId, isEncrypted: 1 }),
+    })
+
+    const sending = instance.sendMessage({ text: 'hi' })
+
+    if (enforced) {
+      await expect(sending).rejects.toThrow('This model is not available for encrypted conversations.')
+      expect(sendMessage).not.toHaveBeenCalled()
+    } else {
+      await sending
+      expect(sendMessage).toHaveBeenCalledTimes(1)
+    }
   })
 
   it('throws the friendly guard (not a TypeError) when a turn starts with no selected model', async () => {
@@ -907,6 +984,21 @@ describe('createChatInstance — retry policy', () => {
     expect(sentMessage.metadata?.debugTranscript?.engine).toBeNull()
     expect(Object.hasOwn(sentMessage.metadata ?? {}, 'debugTranscript')).toBe(true)
     expect(savedMessage?.metadata?.debugTranscript?.engine).toBe('legacy')
+  })
+
+  it.each([
+    ['managed-http', 'hosted'],
+    ['remote-acp', 'acp'],
+  ] as const)('keeps a %s turn stamped as engine %p once it finishes', async (type, engine) => {
+    const saveMessages = mock(async (_input: Parameters<SaveMessagesFunction>[0]) => {})
+    const { finishSuccessfully, instance } = createRetryHarness(saveMessages)
+    useChatStore.getState().updateSession(sessionId, { selectedAgent: { ...builtInAgent, type } })
+    setDebugTranscriptCaptureEnabled(true)
+
+    await instance.sendMessage({ text: 'route this turn' })
+    await finishSuccessfully()
+
+    expect(saveMessages.mock.calls[0]?.[0].messages[0]?.metadata?.debugTranscript?.engine).toBe(engine)
   })
 
   it('starts stamping only new messages after capture is enabled mid-session', async () => {

@@ -8,6 +8,8 @@ import {
   getChatErrorKind,
   getInferenceQuotaWindow,
   type InferenceQuotaWindow,
+  isAgentInstructionsTooLargeError,
+  isAgentRunInProgressError,
   isContextOverflowError,
   isRateLimitError,
 } from '@/lib/error-utils'
@@ -30,8 +32,17 @@ const inferenceQuotaMessages = {
   '7d': msg`You've reached your AI usage limit for the current 7-day window. Try again later.`,
 } satisfies Record<InferenceQuotaWindow, MessageDescriptor>
 
+const agentRunInProgressMessage = msg`The agent is still finishing your previous message. Try again in a minute.`
+const agentInstructionsTooLargeMessage = msg`The instructions from your skills or project are too long for this agent. Shorten a long skill or the project's instructions, then try again.`
+
 /** Resolve final chat error copy after automatic retries stop. */
 const getFinalChatErrorMessage = (error?: Error | null): MessageDescriptor => {
+  if (isAgentRunInProgressError(error)) {
+    return agentRunInProgressMessage
+  }
+  if (isAgentInstructionsTooLargeError(error)) {
+    return agentInstructionsTooLargeMessage
+  }
   const kind = getChatErrorKind(error)
   return (kind && causeSpecificErrorMessages[kind]) || defaultChatErrorMessage
 }
@@ -49,7 +60,9 @@ type ErrorMessageProps = {
 export const ErrorMessage = memo(
   ({ retryCount, retriesExhausted, error, onRetry, deliveryExhausted }: ErrorMessageProps) => {
     const { i18n } = useLingui()
-    const rateLimited = isRateLimitError(error)
+    const runInProgress = isAgentRunInProgressError(error)
+    // A run still in progress is retried after a delay, so it is not shown as a rate limit.
+    const rateLimited = isRateLimitError(error) && !runInProgress
     const inferenceQuotaWindow = getInferenceQuotaWindow(error)
 
     // Show rate limit message immediately — don't auto-retry since the server told us to slow down
@@ -98,9 +111,15 @@ export const ErrorMessage = memo(
           <div className="flex items-center gap-2">
             <Loader2 className="size-[var(--icon-size-sm)] text-amber-500 animate-spin" />
             <p className="text-amber-500/80 text-[length:var(--font-size-body)]">
-              <Trans>
-                Something went wrong. Retrying ({retryCount}/{maxRetries})…
-              </Trans>
+              {runInProgress ? (
+                <Trans>
+                  The agent is still finishing your previous message. Trying again ({retryCount}/{maxRetries})…
+                </Trans>
+              ) : (
+                <Trans>
+                  Something went wrong. Retrying ({retryCount}/{maxRetries})…
+                </Trans>
+              )}
             </p>
           </div>
         </div>

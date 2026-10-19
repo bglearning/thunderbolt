@@ -8,12 +8,12 @@ import babelPlugin from '@rolldown/plugin-babel'
 import { storybookTest } from '@storybook/addon-vitest/vitest-plugin'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
-import { execSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import path from 'path'
-import { defineConfig } from 'vite'
+import { type Connect, defineConfig } from 'vite'
 import { analyzer } from 'vite-bundle-analyzer'
 import pkg from './package.json' with { type: 'json' }
+import { copyPowerSyncAssets } from './scripts/copy-powersync-assets'
 const dirname = typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url))
 
 // More info at: https://storybook.js.org/docs/next/writing-tests/integrations/vitest-addon
@@ -29,6 +29,23 @@ const shouldAnalyze = process.env.ANALYZE?.toLowerCase() === 'true' || process.a
 // Source maps are disabled by default so forks don't accidentally expose proprietary code.
 // Enable with ENABLE_SOURCEMAP=true (e.g. in CI) to upload maps to PostHog for error tracking.
 const sourcemap = process.env.ENABLE_SOURCEMAP?.toLowerCase() === 'true' ? 'hidden' : false
+
+/** Response headers for the dev and preview servers, matching deploy/config/security-headers.conf. */
+const setResponseHeaders: Connect.NextHandleFunction = (req, res, next) => {
+  res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless')
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
+
+  // Set correct Content-Type for .well-known files (required for Universal Links / App Links)
+  // Parse pathname to ignore query parameters
+  const pathname = req.url?.split('?')[0]
+  if (pathname === '/.well-known/apple-app-site-association') {
+    res.setHeader('Content-Type', 'application/json')
+  } else if (pathname === '/.well-known/assetlinks.json') {
+    res.setHeader('Content-Type', 'application/json')
+  }
+
+  next()
+}
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -62,8 +79,15 @@ export default defineConfig({
   plugins: [
     {
       name: 'copy-powersync-assets',
-      buildStart() {
-        execSync('powersync-web copy-assets --output public', { stdio: 'inherit' })
+      // `vite preview` serves the built dist/, so it has no reason to touch public/.
+      apply: (_config, { isPreview }) => !isPreview,
+      // Vite lists public/ once, right after this hook; a copy in buildStart lands after that list.
+      configResolved({ publicDir, cacheDir }) {
+        copyPowerSyncAssets(
+          path.resolve(__dirname, 'node_modules/@powersync/web/dist'),
+          path.join(publicDir, '@powersync'),
+          cacheDir,
+        )
       },
     },
     tailwindcss(),
@@ -96,21 +120,11 @@ export default defineConfig({
     {
       name: 'configure-response-headers',
       configureServer: (server) => {
-        server.middlewares.use((req, res, next) => {
-          res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless')
-          res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
-
-          // Set correct Content-Type for .well-known files (required for Universal Links / App Links)
-          // Parse pathname to ignore query parameters
-          const pathname = req.url?.split('?')[0]
-          if (pathname === '/.well-known/apple-app-site-association') {
-            res.setHeader('Content-Type', 'application/json')
-          } else if (pathname === '/.well-known/assetlinks.json') {
-            res.setHeader('Content-Type', 'application/json')
-          }
-
-          next()
-        })
+        server.middlewares.use(setResponseHeaders)
+      },
+      // `vite preview` serves the production build, so it needs the same cross-origin isolation as production.
+      configurePreviewServer: (server) => {
+        server.middlewares.use(setResponseHeaders)
       },
     },
     {
@@ -224,8 +238,8 @@ export default defineConfig({
         }
       : undefined,
     watch: {
-      // 3. tell vite to ignore watching `src-tauri`
-      ignored: ['**/src-tauri/**'],
+      // 3. tell vite to ignore watching `src-tauri`, and the QA agent's output (Playwright traces would reload the page)
+      ignored: ['**/src-tauri/**', '**/qa-out*/**'],
     },
     fs: {
       strict: true,

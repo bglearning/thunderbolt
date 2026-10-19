@@ -130,6 +130,46 @@ describe('ErrorMessage', () => {
     })
   })
 
+  describe('hosted agent run in progress', () => {
+    // How the managed-http adapter serializes the endpoint's 429.
+    const runInProgress = new Error(
+      JSON.stringify({ error: JSON.stringify({ error: { code: 'AGENT_RUN_IN_PROGRESS' } }), status: 429 }),
+    )
+
+    it('says the agent is still answering while the delayed retry is pending, not a rate limit', () => {
+      render(<ErrorMessage retryCount={1} retriesExhausted={false} error={runInProgress} />)
+
+      expect(
+        screen.getByText(`The agent is still finishing your previous message. Trying again (1/${maxRetries})…`),
+      ).toBeTruthy()
+      expect(screen.queryByText('Too many requests. Please try again in a moment.')).toBeNull()
+    })
+
+    it('offers Retry with its own copy once the retries are spent', () => {
+      const onRetry = mock(() => {})
+      render(<ErrorMessage retryCount={maxRetries} retriesExhausted={true} error={runInProgress} onRetry={onRetry} />)
+
+      expect(
+        screen.getByText('The agent is still finishing your previous message. Try again in a minute.'),
+      ).toBeTruthy()
+      fireEvent.click(screen.getByText('Retry'))
+      expect(onRetry).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('names oversized project and skill instructions when the hosted agent refuses them', () => {
+    const tooLarge = new Error(
+      JSON.stringify({ error: JSON.stringify({ error: { code: 'AGENT_INSTRUCTIONS_TOO_LARGE' } }), status: 400 }),
+    )
+    render(<ErrorMessage retryCount={0} retriesExhausted={true} error={tooLarge} />)
+
+    expect(
+      screen.getByText(
+        "The instructions from your skills or project are too long for this agent. Shorten a long skill or the project's instructions, then try again.",
+      ),
+    ).toBeTruthy()
+  })
+
   describe('auto-retry in progress', () => {
     it('should show retry spinner when retryCount > 0 and retries not exhausted', () => {
       render(<ErrorMessage retryCount={1} retriesExhausted={false} />)

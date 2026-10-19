@@ -16,6 +16,7 @@ const inferenceQuotaErrorSchema = z.object({
 })
 const inferenceQuotaResponseSchema = z.object({ error: inferenceQuotaErrorSchema })
 const serializedErrorSchema = z.object({ error: z.string() })
+const agentErrorBodySchema = z.object({ error: z.object({ code: z.string() }) })
 const toolParameterErrorSchema = z.object({ param: z.literal('tools') })
 const toolParameterResponseSchema = z.union([toolParameterErrorSchema, z.object({ error: toolParameterErrorSchema })])
 
@@ -71,6 +72,22 @@ const getErrorClassificationFields = (error: unknown): ErrorClassificationFields
     message: firstString(value.responseBody, value.message),
   }
 }
+
+/**
+ * The error `Response` an agent adapter hands the AI SDK in place of a stream:
+ * `{ error, status, kind }`, which `DefaultChatTransport` throws as the error
+ * message and the chat error UI parses back (`getChatErrorKind`,
+ * `getInferenceQuotaWindow`, and the `isAgent*Error` helpers).
+ */
+export const createChatErrorResponse = (
+  message: string,
+  status: number | undefined,
+  kind: ChatErrorKind | undefined,
+): Response =>
+  new Response(JSON.stringify({ error: message, status, kind }), {
+    status: status ?? 500,
+    headers: { 'Content-Type': 'application/json' },
+  })
 
 /**
  * Classify a raw pipeline error into a stable user-facing chat error kind.
@@ -193,6 +210,35 @@ export const getInferenceQuotaWindow = (error?: Error | null): InferenceQuotaWin
 }
 
 /**
+ * Whether the hosted agent refused the turn because the user's previous reply is
+ * still running (`429 AGENT_RUN_IN_PROGRESS` from `POST /v1/agent/chat`, as the
+ * managed-http adapter serializes it). Unlike a rate limit it clears on its own
+ * once that run finishes, so the chat retries it after a delay.
+ */
+export const isAgentRunInProgressError = (error?: Error | null): boolean =>
+  getAgentErrorCode(error, 429) === 'AGENT_RUN_IN_PROGRESS'
+
+/**
+ * Whether the hosted agent refused the turn because the project and skill
+ * instructions sent with it are over its cap (`400 AGENT_INSTRUCTIONS_TOO_LARGE`
+ * from `POST /v1/agent/chat`). Skill instructions have no length cap of their
+ * own, so one long skill is enough to trip it.
+ */
+export const isAgentInstructionsTooLargeError = (error?: Error | null): boolean =>
+  getAgentErrorCode(error, 400) === 'AGENT_INSTRUCTIONS_TOO_LARGE'
+
+/** The `error.code` of a hosted agent refusal with the given status, as the managed-http adapter serializes it. */
+const getAgentErrorCode = (error: Error | null | undefined, status: number): string | undefined => {
+  if (!error?.message || getErrorStatusCode(error) !== status) {
+    return undefined
+  }
+  const serializedError = serializedErrorSchema.safeParse(parseJson(error.message))
+  const responseBody = serializedError.success ? parseJson(serializedError.data.error) : undefined
+  const agentError = agentErrorBodySchema.safeParse(responseBody)
+  return agentError.success ? agentError.data.error.code : undefined
+}
+
+/**
  * The provider/SDK's own retry verdict, if it survived serialization
  * (`serializeStreamError` includes `isRetryable` for `APICallError` and the
  * client-side `UnsupportedFunctionalityError`). `false` means identical input
@@ -261,12 +307,17 @@ const isToolParameterError = (message: string): boolean => {
  * `content.str` error) or the 422 `serializeStreamError` mints for a file-part
  * `UnsupportedFunctionalityError`. Deliberately narrow: it excludes auth
  * (401/403), not-found (404), timeouts (408), rate limits (429), context overflow,
- * and structured tool-parameter errors — none of which attachment remediation
- * can fix by re-delivering as text/images. This is the ONLY signal that should
- * trigger remediation.
+ * structured tool-parameter errors, and the hosted agent's oversized-instructions
+ * 400. Attachment remediation can fix none of these by re-delivering as
+ * text/images. This is the ONLY signal that should trigger remediation.
  */
 export const isContentRejectionError = (error?: Error | null): boolean => {
-  if (!error?.message || isRateLimitError(error) || isContextOverflowError(error)) {
+  if (
+    !error?.message ||
+    isRateLimitError(error) ||
+    isContextOverflowError(error) ||
+    isAgentInstructionsTooLargeError(error)
+  ) {
     return false
   }
   const status = getErrorStatusCode(error)

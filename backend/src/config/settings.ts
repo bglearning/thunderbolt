@@ -2,20 +2,47 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+import { maxAgentSteps } from '@/hosted-agent/limits'
 import { httpUrlMessage, isHttpUrl, type PublicMiniApp } from '@shared/mini-app-registry'
 import { z } from 'zod'
 import { inferenceUsageReceiptHeader } from '@shared/inference-usage'
+import { loopbackOrigin } from '@shared/url'
 
 const betterAuthTimeString = z.string().regex(/^\d+[smhd]$/, {
   message: 'must be a Better Auth time string (digits followed by s, m, h, or d)',
 })
 const defaultAnonymousSignInRateLimitMax = 10
 const defaultAnonymousSignInRateLimitWindowSecs = 60
-const defaultCorsExposeHeaders = `set-auth-token,X-Proxy-Final-Url,X-Proxy-Passthrough-Content-Type,X-Proxy-Passthrough-Mcp-Session-Id,X-Proxy-Passthrough-Mcp-Protocol-Version,X-Proxy-Passthrough-Location,X-Proxy-Passthrough-Anthropic-Version,WWW-Authenticate,Ehbp-Response-Nonce,X-Proxy-Timing,Server-Timing,${inferenceUsageReceiptHeader}`
+
+/**
+ * Derive a WebAuthn Relying Party ID (a bare hostname) from the app URL. The RP ID
+ * must equal the web origin's host (or a parent of it), so the app's own URL is the
+ * correct default for every deployment — dev, prod, and self-hosted alike.
+ */
+const rpIdFromAppUrl = (appUrl: string): string => (URL.canParse(appUrl) ? new URL(appUrl).hostname : '')
+
+/** WebAuthn forbids IP addresses as a Relying Party ID; it must be a domain name. */
+const isIpLiteral = (host: string): boolean => /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.startsWith('[')
+
+const defaultCorsExposeHeaders = `set-auth-token,X-Proxy-Final-Url,X-Proxy-Passthrough-Content-Type,X-Proxy-Passthrough-Mcp-Session-Id,X-Proxy-Passthrough-Mcp-Protocol-Version,X-Proxy-Passthrough-Location,X-Proxy-Passthrough-Anthropic-Version,WWW-Authenticate,Ehbp-Response-Nonce,X-Proxy-Timing,Server-Timing,X-Passkey-Challenge,${inferenceUsageReceiptHeader}`
 
 /**
  * Settings schema for environment variables validation
  */
+/**
+ * Whether `Intl` accepts `value` as a time zone: an IANA name, or a UTC offset such as `+01:00`.
+ * Asks `DateTimeFormat` rather than `Intl.supportedValuesOf('timeZone')`, whose list omits aliases
+ * such as `UTC` on some engines.
+ */
+const isTimeZone = (value: string): boolean => {
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: value })
+    return true
+  } catch {
+    return false
+  }
+}
+
 const settingsSchema = z
   .object({
     // API Keys
@@ -35,8 +62,10 @@ const settingsSchema = z
     // OAuth Settings
     googleClientId: z.string().trim().default(''),
     googleClientSecret: z.string().trim().default(''),
+    googleBaseUrl: z.string().default('https://oauth2.googleapis.com'),
     microsoftClientId: z.string().trim().default(''),
     microsoftClientSecret: z.string().trim().default(''),
+    microsoftBaseUrl: z.string().default('https://login.microsoftonline.com'),
 
     // OIDC Settings (enterprise self-hosted)
     authMode: z.enum(['consumer', 'oidc', 'saml']).default('consumer'),
@@ -44,6 +73,8 @@ const settingsSchema = z
     // is NOT registered so /v1/api/auth/sign-in/anonymous returns 404. Defense-in-depth
     // against a malicious client bypassing the frontend gate via direct curl.
     authAllowAnonymous: z.boolean().default(false),
+    // Anonymous users idle this many days are hard-deleted by an hourly sweep; 0 keeps them forever.
+    anonymousUserIdleDays: z.coerce.number().int().nonnegative().default(30),
     oidcClientId: z.string().default(''),
     oidcClientSecret: z.string().default(''),
     oidcIssuer: z.string().default(''),
@@ -97,9 +128,9 @@ const settingsSchema = z
     powersyncInternalUrl: z.string().default(''),
     powersyncJwtKid: z.string().default(''),
     powersyncJwtSecret: z.string().default(''),
-    // PowerSync verifies this JWT locally (signature + expiry) and never calls back to us, so a
-    // revoked device keeps reading the sync stream until its current token expires. This value
-    // therefore *is* the post-revocation read window for downloads — keep it short.
+    // PowerSync verifies this JWT locally (signature + expiry) and never calls back to us. Revocation
+    // cuts the stream through the sync rules; this only bounds how long a device can keep
+    // reconnecting — keep it short.
     powersyncTokenExpirySeconds: z.coerce.number().int().positive().default(300),
 
     /**
@@ -143,6 +174,7 @@ const settingsSchema = z
     corsAllowMethods: z.string().default('GET,POST,PUT,DELETE,PATCH,OPTIONS'),
     corsAllowHeaders: z.string().default(''),
     // Protocol-required: frontend proxy-fetch.ts unwrap needs these visible cross-origin (cors does not echo expose-headers).
+    // X-Proxy-Final-Url also tells the client a 401 came from an upstream, not our session gate.
     corsExposeHeaders: z.string().default(defaultCorsExposeHeaders),
 
     // Org escrow (THU-804 POC) — operator-controlled AK recipient. When enabled, every
@@ -153,6 +185,18 @@ const settingsSchema = z
     // target. Recovery runs offline via scripts/org-escrow-decrypt.ts with the
     // operator-held private key.
     orgEscrowEnabled: z.boolean().default(false),
+
+    // Passkey (WebAuthn) sign-in and passkey sync unlock. Off unless PASSKEY_ENABLED,
+    // and never in SSO modes (see `isPasskeyEnabled`). The Relying Party ID derives
+    // from APP_URL's hostname unless PASSKEY_RP_ID overrides it (e.g. an apex to
+    // share passkeys across subdomains). It is permanent per deployment: changing it
+    // — including by changing APP_URL — orphans every registered credential.
+    passkeyEnabled: z.boolean().default(false),
+    passkeyRpId: z.string().trim().default(''),
+    passkeyRpName: z.string().trim().default('Thunderbolt'),
+    // Comma-separated `android:apk-key-hash:<base64url sha256 of the signing cert>`
+    // origins: Android puts that, not a web origin, in the passkey's clientDataJSON.
+    passkeyAndroidOrigins: z.string().default(''),
 
     // Intake role: mounts POST /v1/debug-transcripts/intake. Thunderbolt production only.
     debugTranscriptIntakeEnabled: z.boolean().default(false),
@@ -196,8 +240,23 @@ const settingsSchema = z
       .int()
       .positive()
       .default(defaultAnonymousSignInRateLimitWindowSecs),
-    // Providers are added together with their verifier (backend/src/auth/captcha.ts).
-    captchaProvider: z.enum(['none']).default('none'),
+    // Deployment-wide anonymous sign-in budget: one constant-key bucket shared by every IP, so
+    // a raised per-IP limit cannot mint unbounded accounts. It bounds worst-case anonymous
+    // inference spend at this many accounts times the per-account quota, per window.
+    anonymousSignInGlobalRateLimitMax: z.coerce.number().int().positive().default(2000),
+    anonymousSignInGlobalRateLimitWindowSecs: z.coerce.number().int().positive().default(3600),
+    // Each value maps to a provider in createCaptchaProvider (backend/src/auth/captcha.ts).
+    captchaProvider: z.enum(['none', 'altcha']).default('none'),
+    // ALTCHA_* settings apply only when CAPTCHA_PROVIDER=altcha.
+    // HMAC key signing ALTCHA challenges; required (32+ characters) when the provider is altcha.
+    altchaSecret: z.string().default(''),
+    // ALTCHA maxnumber: a client tries maxnumber/2 SHA-256 hashes on average, so this trades
+    // bot cost against how long a low-end phone spins before sign-in. The 100000 default solves
+    // in about 80 ms (median, single thread) in Bun on Apple silicon; phones are slower.
+    // The floor is a sanity bound, not the control: a native solver needs only milliseconds at
+    // any sane difficulty, so the global anonymous sign-in budget is what caps a scripted run.
+    altchaDifficulty: z.coerce.number().int().min(50_000).default(100_000),
+    altchaTtlSecs: z.coerce.number().int().positive().default(600),
 
     // Managed inference rolling quotas (integer cents)
     inferenceQuotaAnonymousFiveHourCents: z.coerce.number().int().positive().default(10),
@@ -219,6 +278,10 @@ const settingsSchema = z
     // list (not just disabled) — for deployments that ship only their own agents (e.g. Deepset).
     // Surfaced to the UI via GET /config as `builtInAgentEnabled`.
     disableBuiltInAgent: z.boolean().default(false),
+    // When true, the app shows a chat-only shell for public deployments: no Settings, Projects,
+    // skill chips, account control or agent menu.
+    // Surfaced to the UI via GET /config as `minimalMode`.
+    minimalMode: z.boolean().default(false),
     // Haystack-specific config (consumed by the Haystack provider, defined here for centralized config).
     haystackBaseUrl: z.string().default(''),
     haystackApiKey: z.string().default(''),
@@ -229,21 +292,42 @@ const settingsSchema = z
     haystackPipelines: z.string().default(''),
 
     // Hosted agent settings (see `@/hosted-agent/routes`). Name, description, icon and anonymous discovery
-    // feed `GET /agents` (see `@/hosted-agent/provider`). The max-steps and MCP settings have no effect yet.
+    // feed `GET /agents` (see `@/hosted-agent/provider`).
     agentEnabled: z.boolean().default(false),
     agentModel: z.string().default(''),
-    // No effect until MCP tools land (GTM-28): without tools every run is a single step.
-    agentMaxSteps: z.coerce.number().int().positive().default(8),
+    // Most model steps per run, each tool round trip being one more. Without tools every run is a single step. At most
+    // `maxAgentSteps`, the most a reply can take under its tool-call budget.
+    agentMaxSteps: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(maxAgentSteps, { message: `AGENT_MAX_STEPS must be at most ${maxAgentSteps}` })
+      .default(8),
     agentSystemPrompt: z.string().default(''),
-    // JSON array of MCP server descriptors the hosted agent may call.
+    // JSON array of MCP servers whose read-only tools the hosted agent may call, parsed by `parseAgentMcpServers`
+    // (`@/hosted-agent/mcp`) when the agent mounts, so a malformed value fails the boot.
     agentMcpServers: z.string().default(''),
     agentName: z.string().default('Assistant'),
     agentDescription: z.string().default(''),
     agentIcon: z.string().default(''),
+    // IANA zone for the date line in the agent's system prompt. The server runs in UTC; an event deployment sets
+    // the venue's zone. Checked at startup so a typo fails the boot instead of every request.
+    agentTimezone: z
+      .string()
+      .default('UTC')
+      .refine(isTimeZone, { message: 'AGENT_TIMEZONE must be an IANA time zone or a UTC offset' }),
     // When true, anonymous sessions may call `GET /agents` and see only anonymous-safe agents.
     allowAnonymousAgentDiscovery: z.boolean().default(false),
   })
   .superRefine((data, ctx) => {
+    if (data.passkeyEnabled && (!data.passkeyRpId || isIpLiteral(data.passkeyRpId))) {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          'PASSKEY_ENABLED needs a domain-name Relying Party ID: set APP_URL to an absolute https URL on a domain, or set PASSKEY_RP_ID',
+        path: ['passkeyRpId'],
+      })
+    }
     if (data.powersyncUrl && data.powersyncJwtSecret.length < 32) {
       ctx.addIssue({
         code: 'too_small',
@@ -255,8 +339,13 @@ const settingsSchema = z
         input: '[REDACTED]',
       })
     }
-    // With 'none' the only accepted provider, this refuses every raised limit while anonymous
-    // auth is on. The captchaProvider check starts mattering once a real provider ships.
+    if (data.captchaProvider === 'altcha' && data.altchaSecret.length < 32) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'ALTCHA_SECRET must be at least 32 characters when CAPTCHA_PROVIDER=altcha',
+        path: ['altchaSecret'],
+      })
+    }
     const anonymousSignInLimitRaised =
       data.anonymousSignInRateLimitMax > defaultAnonymousSignInRateLimitMax ||
       data.anonymousSignInRateLimitWindowSecs < defaultAnonymousSignInRateLimitWindowSecs
@@ -264,7 +353,7 @@ const settingsSchema = z
       ctx.addIssue({
         code: 'custom',
         message:
-          'Raising the anonymous sign-in rate limit (ANONYMOUS_SIGN_IN_RATE_LIMIT_MAX above 10 or ANONYMOUS_SIGN_IN_RATE_LIMIT_WINDOW_SECS below 60) with AUTH_ALLOW_ANONYMOUS=true requires CAPTCHA_PROVIDER to be set (no provider is supported yet; see docs/self-hosting/configuration.md#anonymous-sign-in).',
+          'Raising the anonymous sign-in rate limit (ANONYMOUS_SIGN_IN_RATE_LIMIT_MAX above 10 or ANONYMOUS_SIGN_IN_RATE_LIMIT_WINDOW_SECS below 60) with AUTH_ALLOW_ANONYMOUS=true requires CAPTCHA_PROVIDER to be set. Set CAPTCHA_PROVIDER=altcha and build the app with VITE_CAPTCHA_PROVIDER=altcha, or keep the defaults (see docs/self-hosting/configuration.md#anonymous-sign-in).',
         path: ['captchaProvider'],
       })
     }
@@ -398,6 +487,7 @@ export const toPublicMiniApps = (apps: ReadonlyMap<string, MiniAppConfig>): Publ
  */
 const parseSettings = (): Settings => {
   const isDevelopment = process.env.NODE_ENV === 'development'
+  const appUrl = process.env.APP_URL || 'http://localhost:1420'
   const env = {
     fireworksApiKey: process.env.FIREWORKS_API_KEY || '',
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
@@ -409,10 +499,15 @@ const parseSettings = (): Settings => {
     monitoringToken: process.env.MONITORING_TOKEN || '',
     googleClientId: process.env.GOOGLE_CLIENT_ID || '',
     googleClientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
+    // Only a loopback override (a QA stack's fake provider) is honoured, so the client secret never leaves for
+    // another host.
+    googleBaseUrl: loopbackOrigin(process.env.GOOGLE_BASE_URL) ?? 'https://oauth2.googleapis.com',
     microsoftClientId: process.env.MICROSOFT_CLIENT_ID || '',
     microsoftClientSecret: process.env.MICROSOFT_CLIENT_SECRET || '',
+    microsoftBaseUrl: loopbackOrigin(process.env.MICROSOFT_BASE_URL) ?? 'https://login.microsoftonline.com',
     authMode: (process.env.AUTH_MODE || 'consumer').toLowerCase(),
     authAllowAnonymous: process.env.AUTH_ALLOW_ANONYMOUS === 'true',
+    anonymousUserIdleDays: process.env.ANONYMOUS_USER_IDLE_DAYS || undefined,
     oidcClientId: process.env.OIDC_CLIENT_ID || '',
     oidcClientSecret: process.env.OIDC_CLIENT_SECRET || '',
     oidcIssuer: process.env.OIDC_ISSUER || '',
@@ -428,7 +523,7 @@ const parseSettings = (): Settings => {
     apiKeyDefaultExpiresInSeconds: process.env.API_KEY_DEFAULT_EXPIRES_IN,
     logLevel: (process.env.LOG_LEVEL || 'INFO').toUpperCase(),
     port: process.env.PORT || '8000',
-    appUrl: process.env.APP_URL || 'http://localhost:1420',
+    appUrl,
     posthogHost: process.env.POSTHOG_HOST || 'https://us.i.posthog.com',
     posthogApiKey: process.env.POSTHOG_API_KEY || '',
     waitlistEnabled: process.env.WAITLIST_ENABLED === 'true',
@@ -484,6 +579,12 @@ const parseSettings = (): Settings => {
     corsAllowHeaders: process.env.CORS_ALLOW_HEADERS || '',
     corsExposeHeaders: process.env.CORS_EXPOSE_HEADERS || defaultCorsExposeHeaders,
     orgEscrowEnabled: process.env.ORG_ESCROW_ENABLED === 'true',
+    passkeyEnabled: process.env.PASSKEY_ENABLED === 'true',
+    // Derived only when passkeys are on, so an APP_URL that isn't a full URL can
+    // never break a deployment that doesn't use them.
+    passkeyRpId: process.env.PASSKEY_RP_ID || (process.env.PASSKEY_ENABLED === 'true' ? rpIdFromAppUrl(appUrl) : ''),
+    passkeyRpName: process.env.PASSKEY_RP_NAME || 'Thunderbolt',
+    passkeyAndroidOrigins: process.env.PASSKEY_ANDROID_ORIGINS || '',
     debugTranscriptIntakeEnabled: process.env.DEBUG_TRANSCRIPT_INTAKE_ENABLED === 'true',
     debugTranscriptUpstreamUrl: process.env.DEBUG_TRANSCRIPT_UPSTREAM_URL || '',
     debugTranscriptUpstreamKey: process.env.DEBUG_TRANSCRIPT_UPSTREAM_KEY || '',
@@ -494,7 +595,12 @@ const parseSettings = (): Settings => {
     rateLimitEnabled: process.env.RATE_LIMIT_ENABLED !== 'false',
     anonymousSignInRateLimitMax: process.env.ANONYMOUS_SIGN_IN_RATE_LIMIT_MAX || undefined,
     anonymousSignInRateLimitWindowSecs: process.env.ANONYMOUS_SIGN_IN_RATE_LIMIT_WINDOW_SECS || undefined,
+    anonymousSignInGlobalRateLimitMax: process.env.ANONYMOUS_SIGN_IN_GLOBAL_RATE_LIMIT_MAX || undefined,
+    anonymousSignInGlobalRateLimitWindowSecs: process.env.ANONYMOUS_SIGN_IN_GLOBAL_RATE_LIMIT_WINDOW_SECS || undefined,
     captchaProvider: (process.env.CAPTCHA_PROVIDER || 'none').toLowerCase(),
+    altchaSecret: process.env.ALTCHA_SECRET || '',
+    altchaDifficulty: process.env.ALTCHA_DIFFICULTY || undefined,
+    altchaTtlSecs: process.env.ALTCHA_TTL_SECS || undefined,
     inferenceQuotaAnonymousFiveHourCents: process.env.INFERENCE_QUOTA_ANONYMOUS_5H_CENTS,
     inferenceQuotaAnonymousSevenDayCents: process.env.INFERENCE_QUOTA_ANONYMOUS_7D_CENTS,
     inferenceQuotaRegisteredFiveHourCents: process.env.INFERENCE_QUOTA_REGISTERED_5H_CENTS,
@@ -503,6 +609,7 @@ const parseSettings = (): Settings => {
     enabledAgents: process.env.ENABLED_AGENTS || '',
     allowCustomAgents: process.env.ALLOW_CUSTOM_AGENTS !== 'false',
     disableBuiltInAgent: process.env.DISABLE_BUILT_IN_AGENT === 'true',
+    minimalMode: process.env.MINIMAL_MODE === 'true',
     haystackBaseUrl: process.env.HAYSTACK_BASE_URL || '',
     haystackApiKey: process.env.HAYSTACK_API_KEY || '',
     haystackWorkspace: process.env.HAYSTACK_WORKSPACE || '',
@@ -515,6 +622,7 @@ const parseSettings = (): Settings => {
     agentName: process.env.AGENT_NAME || undefined,
     agentDescription: process.env.AGENT_DESCRIPTION || '',
     agentIcon: process.env.AGENT_ICON || '',
+    agentTimezone: process.env.AGENT_TIMEZONE || undefined,
     allowAnonymousAgentDiscovery: process.env.ALLOW_ANONYMOUS_AGENT_DISCOVERY === 'true',
   }
 
@@ -540,6 +648,14 @@ export const getSettings = (): Settings => {
 export const clearSettingsCache = (): void => {
   settings = null
 }
+
+/**
+ * Whether passkeys are offered: the operator turned them on and the deployment
+ * uses consumer auth. SSO deployments leave credentials to the IdP, so a passkey
+ * there would be a sign-in factor the IdP cannot revoke.
+ */
+export const isPasskeyEnabled = (settings: Pick<Settings, 'passkeyEnabled' | 'authMode'>): boolean =>
+  settings.passkeyEnabled && settings.authMode === 'consumer'
 
 /** Parse comma-separated CORS origins into a list. */
 export const getCorsOriginsList = (settings: Pick<Settings, 'corsOrigins'>): string[] => {
@@ -586,6 +702,13 @@ export const isOAuthRedirectUriAllowed = (uri: string, settings: Pick<Settings, 
     return false
   }
 }
+
+/** Parse comma-separated PASSKEY_ANDROID_ORIGINS into a list. */
+export const getPasskeyAndroidOriginsList = (settings: Pick<Settings, 'passkeyAndroidOrigins'>): string[] =>
+  settings.passkeyAndroidOrigins
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0)
 
 export const getCorsMethodsList = (settings: Settings): string[] => {
   return settings.corsAllowMethods

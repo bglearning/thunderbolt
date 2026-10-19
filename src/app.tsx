@@ -14,25 +14,17 @@ import ChatDetailPage from '@/chats/detail'
 import MagicLinkVerify from '@/components/magic-link-verify'
 import OAuthCallback from '@/components/oauth-callback'
 import { AccountDeleted } from '@/components/account-deleted'
+import { DeviceRevoked } from '@/components/device-revoked'
 import { SignedOut } from '@/components/signed-out'
 import { StorageUnavailableScreen } from '@/components/storage-unavailable-screen'
 import NotFound from '@/components/not-found'
-import { RevokedDeviceModal } from '@/components/revoked-device-modal'
 import { WindowControls } from '@/components/window-controls'
 import ChatLayout from '@/layout/main-layout'
 import SettingsLayout from '@/settings/layout'
 import WaitlistLayout from '@/waitlist/layout'
 import WaitlistPage from '@/waitlist/waitlist-page'
 import { HapticsProvider } from '@/hooks/use-haptics'
-import {
-  AuthProvider,
-  DatabaseProvider,
-  HttpClientProvider,
-  SignInModalProvider,
-  useAuth,
-  useDatabase,
-  useHttpClient,
-} from '@/contexts'
+import { AuthProvider, DatabaseProvider, HttpClientProvider, SignInModalProvider } from '@/contexts'
 import { usePageTracking } from '@/hooks/use-analytics'
 import { useAppLanguage } from '@/hooks/use-app-language'
 import { useUnitDefaults } from '@/hooks/use-unit-defaults'
@@ -41,6 +33,7 @@ import { useKeyboardInset } from '@/hooks/use-keyboard-inset'
 import { useViewportLock } from '@/hooks/use-viewport-lock'
 import { useDeviceSessionBinding } from '@/hooks/use-device-session-binding'
 import { useMcpSync } from '@/hooks/use-mcp-sync'
+import { useBootstrapSystemAgents } from '@/hooks/use-bootstrap-system-agents'
 import { PostHogProvider } from '@/lib/posthog'
 import { ThemeProvider } from '@/lib/theme-provider'
 import { AppErrorScreen } from './components/app-error-screen'
@@ -56,7 +49,6 @@ import { ExternalLinkDialogProvider } from './components/chat/markdown-utils'
 import { ContentViewProvider } from './content-view/context'
 import { useAppInitialization } from './hooks/use-app-initialization'
 import { useAppVersionUnsupportedListener } from './hooks/use-app-version-unsupported-listener'
-import { useCredentialEvents } from './hooks/use-credential-events'
 import { useMigrationRecoveryKey } from './hooks/use-migration-recovery-key'
 import { RecoveryKeyDialog } from './components/recovery-key-dialog'
 import { UnsavedRecoveryPhrasePrompt } from './components/unsaved-recovery-phrase-prompt'
@@ -72,9 +64,6 @@ import { useSettings } from './hooks/use-settings'
 import { isSsoMode, isWaitlistBypassed } from './lib/auth-mode'
 import { isTauri } from './lib/platform'
 import { getPowerSyncInstance } from './db/powersync/sync-state'
-import { refreshSystemAgents } from '@/db/seeding/seed-agents'
-import { useLocalSettingsStore } from '@/stores/local-settings-store'
-import { useChatStore } from '@/chats/chat-store'
 import { type ComponentProps, Suspense, lazy, useEffect, useState } from 'react'
 import { markAppMounted } from '@/lib/init-timing'
 import { takeDeviceApprovalReturn } from '@/lib/device-approval-return'
@@ -146,41 +135,6 @@ const preloadAllRouteChunks = () => {
 }
 
 const queryClient = new QueryClient()
-
-/**
- * Hydrate the local-only `agents_system` table from the backend's `/agents`
- * discovery endpoint when the user has a real (non-anonymous) session.
- *
- * Legitimate `useEffect` per CLAUDE.md guidance: synchronizing app state with
- * an external system (the backend) on auth/cloud-URL transitions. There is no
- * render-time computation that could replace this — the fetch must run as a
- * side effect when the gating conditions flip, and PowerSync's reactive query
- * picks up the resulting rows automatically.
- */
-const useBootstrapSystemAgents = () => {
-  const db = useDatabase()
-  const httpClient = useHttpClient()
-  const authClient = useAuth()
-  const { data: session } = authClient.useSession()
-  const cloudUrl = useLocalSettingsStore((s) => s.cloudUrl)
-
-  const isRealUser = !!session?.user && session.user.isAnonymous !== true
-
-  useEffect(() => {
-    if (!isRealUser || !cloudUrl) {
-      return
-    }
-    void (async () => {
-      const result = await refreshSystemAgents(db, httpClient)
-      if (!result.refreshed) {
-        return
-      }
-      for (const agent of result.wireIdentityChangedAgents) {
-        useChatStore.getState().applyAgentWireIdentityChange(agent)
-      }
-    })()
-  }, [isRealUser, cloudUrl, db, httpClient])
-}
 
 const AppContent = ({ initData }: { initData: InitData }) => {
   useDeviceSessionBinding()
@@ -293,6 +247,7 @@ const AppRoutes = ({ initData }: { initData: InitData }) => {
         {/* Fallback routes - no guards */}
         <Route path="/signed-out" element={<SignedOut />} />
         <Route path="/account-deleted" element={<AccountDeleted />} />
+        <Route path="/device-revoked" element={<DeviceRevoked />} />
         <Route path="/not-found" element={<NotFound />} />
         <Route path="*" element={<Navigate to="/not-found" replace />} />
       </Routes>
@@ -333,7 +288,6 @@ export const App = () => {
   // "React mounted" mark for startup telemetry.
   useState(markAppMounted)
   const { initData, initError, isInitializing, clearDatabase } = useAppInitialization()
-  const { revokedDeviceOpen } = useCredentialEvents()
   const { migrationRecoveryKey, clearMigrationRecoveryKey } = useMigrationRecoveryKey()
   useAppVersionUnsupportedListener()
 
@@ -454,9 +408,6 @@ export const App = () => {
         <LazyMotion features={loadMotionFeatures} strict>
           {renderAppContent()}
           <WindowControls />
-          {/* The upgrade blocker replaces the whole app, so it must win over the
-              revoked-device modal that renders outside renderAppContent. */}
-          <RevokedDeviceModal open={revokedDeviceOpen && !upgradeRequired} />
           {/* Seamless v1→v2 migration completed at init — show the new recovery
               phrase once. Blocked while the upgrade screen owns the viewport; the
               phrase is not lost in that case, because the mint marked it pending
